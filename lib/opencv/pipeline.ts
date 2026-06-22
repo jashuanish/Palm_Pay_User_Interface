@@ -160,7 +160,8 @@ function gammaCorrect(cv: any, src: any, gamma = 1.5): any {
   // LUT: ((i/255)^gamma)*255  — matches the notebook's np.power implementation.
   const lut = new cv.Mat(1, 256, cv.CV_8UC1);
   for (let i = 0; i < 256; i++) {
-    lut.data[i] = Math.min(255, Math.max(0, Math.round(Math.pow(i / 255, gamma) * 255)));
+    // notebook: (np.power(i/255, gamma) * 255).astype(np.uint8) — numpy truncates
+    lut.data[i] = Math.min(255, Math.max(0, Math.floor(Math.pow(i / 255, gamma) * 255)));
   }
   const out = new cv.Mat();
   cv.LUT(src, lut, out);

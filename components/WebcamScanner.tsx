@@ -1,18 +1,23 @@
 'use client';
 
 import { motion } from 'framer-motion';
-import { Camera, CameraOff, Hand, Loader2, ScanLine } from 'lucide-react';
+import { Camera, CameraOff, Hand, Loader2, ScanLine, Square } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { GlowButton } from '@/components/ui/GlowButton';
 import { cn } from '@/lib/utils';
 
 interface WebcamScannerProps {
   onCapture: (canvas: HTMLCanvasElement) => void;
+  /** True only while a captured frame is actually being processed. */
   busy?: boolean;
-  captureLabel?: string;
-  /** Require good positioning before the capture button enables. */
-  gated?: boolean;
-  /** Fired once the camera stream is live — used to begin loading the vision engine. */
+  /** Block capture for an external reason (e.g. engine not ready). */
+  disabled?: boolean;
+  /** Auto mode: continuously fire frames on a timer (no manual button). */
+  auto?: boolean;
+  /** Auto-capture cadence in ms (only honoured between processing). */
+  intervalMs?: number;
+  /** Status line shown under the frame in auto mode. */
+  autoStatus?: string;
   onStart?: () => void;
 }
 
@@ -24,22 +29,25 @@ const CAP_H = 480;
 export function WebcamScanner({
   onCapture,
   busy = false,
-  captureLabel = 'Capture Palm',
-  gated = true,
+  disabled = false,
+  auto = false,
+  intervalMs = 650,
+  autoStatus,
   onStart,
 }: WebcamScannerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sampleCanvas = useRef<HTMLCanvasElement | null>(null);
-  const rafTimer = useRef<number | null>(null);
 
   const [status, setStatus] = useState<Status>('idle');
   const [ready, setReady] = useState(false);
   const [hint, setHint] = useState('Align your palm inside the frame');
-  const [countdown, setCountdown] = useState<number | null>(null);
+
+  // Live values the auto-loop reads without re-subscribing.
+  const live = useRef({ ready: false, busy: false, disabled: false });
+  live.current = { ready, busy, disabled };
 
   const stop = useCallback(() => {
-    if (rafTimer.current) window.clearInterval(rafTimer.current);
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   }, []);
@@ -57,14 +65,26 @@ export function WebcamScanner({
         await videoRef.current.play().catch(() => {});
       }
       setStatus('live');
-      onStart?.(); // begin loading the vision engine now that the user is committed
+      onStart?.();
     } catch (e: any) {
       if (e?.name === 'NotAllowedError' || e?.name === 'SecurityError') setStatus('denied');
       else setStatus('nocam');
     }
-  }, []);
+  }, [onStart]);
 
   useEffect(() => () => stop(), [stop]);
+
+  const grab = useCallback(() => {
+    const v = videoRef.current;
+    if (!v || v.readyState < 2) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = CAP_W;
+    canvas.height = CAP_H;
+    canvas.getContext('2d')!.drawImage(v, 0, 0, CAP_W, CAP_H);
+    onCapture(canvas);
+  }, [onCapture]);
+  const grabRef = useRef(grab);
+  grabRef.current = grab;
 
   // Live readiness probe — luminance mean + detail over the centre region.
   useEffect(() => {
@@ -74,19 +94,13 @@ export function WebcamScanner({
     sc.width = 160;
     sc.height = 120;
     const ctx = sc.getContext('2d', { willReadFrequently: true })!;
-
-    const id = window.setInterval(() => {
+    const iv = window.setInterval(() => {
       const v = videoRef.current;
       if (!v || v.readyState < 2) return;
       ctx.drawImage(v, 0, 0, sc.width, sc.height);
-      // centre box (palm guide region)
-      const bx = 36;
-      const by = 18;
-      const bw = sc.width - bx * 2;
-      const bh = sc.height - by * 2;
+      const bx = 36, by = 18, bw = sc.width - 72, bh = sc.height - 36;
       const { data } = ctx.getImageData(bx, by, bw, bh);
-      let sum = 0;
-      let sumSq = 0;
+      let sum = 0, sumSq = 0;
       const n = data.length / 4;
       for (let i = 0; i < data.length; i += 4) {
         const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
@@ -95,57 +109,32 @@ export function WebcamScanner({
       }
       const mean = sum / n;
       const std = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
-
       const bright = mean > 45 && mean < 232;
-      const detailed = std > 16; // something textured (a hand) is present
+      const detailed = std > 16;
       const ok = bright && detailed;
       setReady(ok);
       setHint(
-        !bright
-          ? mean <= 45
-            ? 'Too dark — find better lighting'
-            : 'Too bright — reduce glare'
-          : !detailed
-            ? 'Move your palm closer to fill the frame'
-            : 'Hold steady — palm detected'
+        !bright ? (mean <= 45 ? 'Too dark — find better lighting' : 'Too bright — reduce glare')
+          : !detailed ? 'Move your palm closer to fill the frame'
+            : 'Palm detected — hold steady'
       );
-    }, 220);
-    rafTimer.current = id;
-    return () => window.clearInterval(id);
+    }, 200);
+    return () => window.clearInterval(iv);
   }, [status]);
 
-  const grab = useCallback(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    const canvas = document.createElement('canvas');
-    canvas.width = CAP_W;
-    canvas.height = CAP_H;
-    const ctx = canvas.getContext('2d')!;
-    // capture the raw (un-mirrored) frame — consistent for enroll & login
-    ctx.drawImage(v, 0, 0, CAP_W, CAP_H);
-    onCapture(canvas);
-  }, [onCapture]);
-
-  const triggerCapture = useCallback(() => {
-    if (busy) return;
-    setCountdown(3);
-    let c = 3;
-    const tick = window.setInterval(() => {
-      c -= 1;
-      if (c <= 0) {
-        window.clearInterval(tick);
-        setCountdown(null);
-        grab();
-      } else {
-        setCountdown(c);
-      }
-    }, 650);
-  }, [busy, grab]);
+  // Auto-capture loop: fire a frame whenever positioned and not mid-processing.
+  useEffect(() => {
+    if (!auto || status !== 'live') return;
+    const iv = window.setInterval(() => {
+      const s = live.current;
+      if (s.ready && !s.busy && !s.disabled) grabRef.current();
+    }, intervalMs);
+    return () => window.clearInterval(iv);
+  }, [auto, status, intervalMs]);
 
   return (
     <div className="w-full">
       <div className="relative aspect-[4/3] w-full overflow-hidden rounded-2xl border border-white/10 bg-ink-800">
-        {/* video */}
         <video
           ref={videoRef}
           playsInline
@@ -156,95 +145,43 @@ export function WebcamScanner({
           )}
         />
 
-        {/* guide overlay */}
         {status === 'live' && (
           <div className="pointer-events-none absolute inset-0">
-            {/* dim outside guide */}
             <div className="absolute inset-0 bg-[radial-gradient(ellipse_46%_60%_at_50%_50%,transparent_55%,rgba(5,7,10,0.7)_100%)]" />
-            {/* palm guide */}
             <div
               className={cn(
                 'absolute left-1/2 top-1/2 grid h-[78%] w-[58%] -translate-x-1/2 -translate-y-1/2 place-items-center rounded-[40%] border-2 transition-colors duration-300',
                 ready ? 'border-accent/80' : 'border-white/30'
               )}
             >
-              <Hand
-                className={cn(
-                  'h-2/3 w-2/3 transition-colors duration-300',
-                  ready ? 'text-accent/30' : 'text-white/15'
-                )}
-                strokeWidth={1}
-              />
-              {/* corner brackets */}
-              {[
-                'left-2 top-2 border-l-2 border-t-2',
-                'right-2 top-2 border-r-2 border-t-2',
-                'left-2 bottom-2 border-l-2 border-b-2',
-                'right-2 bottom-2 border-r-2 border-b-2',
-              ].map((c) => (
-                <span
-                  key={c}
-                  className={cn(
-                    'absolute h-6 w-6 transition-colors duration-300',
-                    ready ? 'border-accent' : 'border-primary/70',
-                    c
-                  )}
-                />
+              <Hand className={cn('h-2/3 w-2/3 transition-colors', ready ? 'text-accent/30' : 'text-white/15')} strokeWidth={1} />
+              {['left-2 top-2 border-l-2 border-t-2', 'right-2 top-2 border-r-2 border-t-2', 'left-2 bottom-2 border-l-2 border-b-2', 'right-2 bottom-2 border-r-2 border-b-2'].map((c) => (
+                <span key={c} className={cn('absolute h-6 w-6 transition-colors', ready ? 'border-accent' : 'border-primary/70', c)} />
               ))}
             </div>
 
-            {/* scan sweep */}
+            {/* scan sweep — animates while auto-scanning */}
             <motion.div
               className="absolute inset-x-[21%] h-16 bg-gradient-to-b from-transparent via-primary/25 to-transparent"
               initial={{ top: '12%' }}
               animate={{ top: ['12%', '78%', '12%'] }}
-              transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+              transition={{ duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
             />
 
-            {/* readiness chip */}
             <div className="absolute inset-x-0 bottom-3 flex justify-center">
-              <span
-                className={cn(
-                  'inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold backdrop-blur transition-colors',
-                  ready ? 'bg-accent/20 text-accent' : 'bg-ink-900/70 text-mist-200'
-                )}
-              >
+              <span className={cn('inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold backdrop-blur transition-colors', ready ? 'bg-accent/20 text-accent' : 'bg-ink-900/70 text-mist-200')}>
                 <span className={cn('h-1.5 w-1.5 rounded-full', ready ? 'bg-accent' : 'bg-warn')} />
-                {hint}
+                {autoStatus || hint}
               </span>
             </div>
 
-            {/* live tag */}
             <div className="absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-md bg-ink-900/70 px-2 py-1 font-mono text-[10px] text-accent backdrop-blur">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-danger" /> LIVE · NIR-SIM
+              <span className={cn('h-1.5 w-1.5 rounded-full', busy ? 'bg-primary' : 'bg-danger', 'animate-pulse')} />
+              {busy ? 'PROCESSING' : auto ? 'AUTO-SCANNING' : 'LIVE'} · NIR-SIM
             </div>
           </div>
         )}
 
-        {/* countdown */}
-        {countdown !== null && (
-          <div className="absolute inset-0 grid place-items-center bg-ink-900/40 backdrop-blur-sm">
-            <motion.span
-              key={countdown}
-              initial={{ scale: 0.5, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              className="text-7xl font-black text-white"
-            >
-              {countdown}
-            </motion.span>
-          </div>
-        )}
-
-        {/* busy overlay */}
-        {busy && (
-          <div className="absolute inset-0 grid place-items-center bg-ink-900/60 backdrop-blur-sm">
-            <div className="flex items-center gap-2 text-sm font-semibold text-white">
-              <Loader2 className="h-5 w-5 animate-spin text-primary" /> Processing palm…
-            </div>
-          </div>
-        )}
-
-        {/* non-live states */}
         {status !== 'live' && (
           <div className="absolute inset-0 grid place-items-center p-8 text-center">
             {status === 'idle' && (
@@ -253,9 +190,7 @@ export function WebcamScanner({
                   <Camera className="h-7 w-7" />
                 </span>
                 <p className="mt-4 text-base font-semibold text-white">Camera access required</p>
-                <p className="mt-1 text-sm text-mist-400">
-                  We’ll guide you to position your palm, then capture & process it.
-                </p>
+                <p className="mt-1 text-sm text-mist-400">We’ll guide you to position your palm — then it scans automatically.</p>
               </div>
             )}
             {status === 'requesting' && (
@@ -272,9 +207,7 @@ export function WebcamScanner({
                   {status === 'denied' ? 'Camera permission denied' : 'No camera found'}
                 </p>
                 <p className="mt-1 text-sm text-mist-400">
-                  {status === 'denied'
-                    ? 'Enable camera access in your browser’s site settings, then retry.'
-                    : 'Connect a webcam and retry.'}
+                  {status === 'denied' ? 'Enable camera access in your browser’s site settings, then retry.' : 'Connect a webcam and retry.'}
                 </p>
               </div>
             )}
@@ -282,38 +215,24 @@ export function WebcamScanner({
         )}
       </div>
 
-      {/* controls */}
       <div className="mt-4 flex gap-2">
         {status !== 'live' ? (
-          <GlowButton
-            onClick={start}
-            size="md"
-            className="w-full"
-            disabled={status === 'requesting'}
-          >
+          <GlowButton onClick={start} size="md" className="w-full" disabled={status === 'requesting'}>
             <Camera className="h-4 w-4" /> {status === 'idle' ? 'Enable Camera' : 'Retry'}
           </GlowButton>
         ) : (
-          <>
-            <GlowButton
-              onClick={triggerCapture}
-              size="md"
-              className="flex-1"
-              disabled={busy || countdown !== null || (gated && !ready)}
-            >
-              <ScanLine className="h-4 w-4" /> {captureLabel}
-            </GlowButton>
+          <div className="flex w-full items-center gap-3">
+            <div className="flex flex-1 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-medium text-mist-100">
+              {busy ? <Loader2 className="h-4 w-4 animate-spin text-primary" /> : <ScanLine className="h-4 w-4 text-accent" />}
+              {autoStatus || (ready ? 'Scanning automatically…' : 'Position your palm…')}
+            </div>
             <button
-              onClick={() => {
-                stop();
-                setStatus('idle');
-                setReady(false);
-              }}
-              className="rounded-full border border-white/10 px-4 text-sm font-medium text-mist-200 transition-colors hover:bg-white/5"
+              onClick={() => { stop(); setStatus('idle'); setReady(false); }}
+              className="inline-flex items-center gap-1.5 rounded-full border border-white/10 px-4 py-2.5 text-sm font-medium text-mist-200 transition-colors hover:bg-white/5"
             >
-              Stop
+              <Square className="h-3.5 w-3.5" /> Stop
             </button>
-          </>
+          </div>
         )}
       </div>
     </div>
