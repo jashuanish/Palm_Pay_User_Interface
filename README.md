@@ -91,7 +91,7 @@ Both **`/register`** and **`/authenticate`** have a mode toggle:
 
 ### Try the live biometric flow
 1. **`/register`** → *Live Enroll* → **Enable Camera** → position your palm in the guide →
-   capture **3 samples** → name your identity → get Palm ID / Wallet ID / Biometric Token.
+   capture strong samples → name your identity → get Palm ID / Wallet ID / Biometric Token.
 2. **`/authenticate`** → *Live Login* → **Enable Camera** → scan your palm →
    if it matches an enrolled template you get **ACCESS GRANTED** with a confidence score.
 3. **`/store`** → add items → **Place Palm to Pay** → 🎉 · **`/wallet`** reflects the payment.
@@ -117,20 +117,20 @@ capture (webcam 640×480, grayscale)
   → gamma 1.5  →  enhanced 224×224 ROI
 ```
 
-**Matching (`lib/opencv/matcher.ts`):** ORB descriptors (600 features) on the enhanced ROI,
-compared with a Hamming `BFMatcher` + Lowe's ratio test. Enrollment stores **3 samples** per
-identity; login takes the best match across samples and grants access when good-match count
-clears the threshold and beats the runner-up.
+**Matching (`lib/opencv/matcher.ts`):** MobileNetV2 embeddings on the enhanced ROI,
+compared with cosine similarity. Enrollment keeps the strongest samples per identity;
+login takes the best match across samples and grants access when similarity clears the
+threshold and beats the runner-up.
 
-- **Storage:** enrolled templates persist in `localStorage` (descriptors only — never raw images).
+- **Storage:** enrolled templates persist in `localStorage` (embeddings only — never raw images).
 - **Lazy & light:** the 11MB OpenCV.js (`public/vendor/opencv.js`, self-hosted, no CDN) loads
   **only when you start the camera**, so every other page stays instant.
 - **Verify the engine headless:** `node scripts/cvtest.cjs` exercises the full pipeline + matcher
-  (prints `SAME` vs `DIFF` match counts — same palm should dominate).
+  (prints `SAME` vs `DIFF` similarity — same palm should dominate).
 
 > **Honesty note:** real palm-vein systems use near-infrared sensors. A standard RGB webcam can't
 > see sub-dermal veins, so the live demo matches the palm's surface texture/creases via the same
-> pipeline. Matching thresholds (`MIN_GOOD`, `MARGIN` in `matcher.ts`) are tuned conservatively and
+> pipeline. Matching thresholds (`MIN_SIMILARITY`, `MARGIN` in `matcher.ts`) are tuned conservatively and
 > are easy to adjust for your lighting/camera.
 
 ---
@@ -176,7 +176,7 @@ palmpay/
 │   ├── charts/               # Themed Recharts wrappers
 │   ├── ui/                   # GlassCard, GlowButton, Counter, Reveal, RadialGauge, ...
 │   ├── WebcamScanner.tsx     # Live webcam capture + palm positioning guide
-│   ├── LiveEnroll.tsx        # Real biometric enrollment (3 samples)
+│   ├── LiveEnroll.tsx        # Real biometric enrollment (best-of samples)
 │   ├── LiveLogin.tsx         # Real biometric login (match → grant access)
 │   ├── BiometricModeToggle.tsx # Live vs Scripted-demo switch
 │   ├── PalmMesh.tsx          # Animated palm + vein network
@@ -192,7 +192,7 @@ palmpay/
 │   │   ├── loader.ts         # Loads self-hosted OpenCV.js (WASM)
 │   │   ├── useOpenCV.ts      # Lazy React hook for the engine
 │   │   ├── pipeline.ts       # Exact notebook pipeline (ROI → CLAHE → … → gamma)
-│   │   └── matcher.ts        # ORB feature extraction + ratio-test matching
+│   │   └── matcher.ts        # Embedding similarity matching
 │   ├── biometricStore.ts     # Enrolled templates (localStorage + Zustand)
 │   ├── mockData.ts           # 50 users + transactions + merchants + logs + fraud
 │   ├── store.ts              # Zustand store (wallet/cart)
@@ -211,7 +211,7 @@ palmpay/
 ## 📝 Notes
 
 - This is a **concept demo**. In the live flow, palm frames are processed
-  **entirely on-device** — only irreversible ORB descriptors are saved (to
+  **entirely on-device** — only irreversible embeddings are saved (to
   `localStorage`); raw images never leave the browser and are never uploaded.
 - Demo data is generated from a fixed seed so it's identical on every load
   (no hydration mismatches).

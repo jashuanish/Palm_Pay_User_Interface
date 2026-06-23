@@ -1,10 +1,9 @@
 """
-PalmPay — optional FastAPI service.
+PalmPay — FastAPI service.
 
-Mirrors the frontend's demo data as real REST endpoints. The Next.js app runs
-fully standalone with built-in mock data, so this service is optional — it
-exists to demonstrate the production architecture (FastAPI + Supabase) and to
-let you point the frontend at a live API if you wish.
+Serves both:
+  - The original demo REST endpoints (users, transactions, merchants, fraud, etc.)
+  - NEW: /api/ml/* — trained palm vein embedding endpoints (PyTorch TorchScript)
 
 Run:
     uvicorn main:app --reload --port 8000
@@ -15,7 +14,7 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timezone
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +23,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="PalmPay API",
     description="Biometric payments powered by palm vein intelligence.",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # Allow the Next.js dev server (and anything, for the demo) to call us.
@@ -34,6 +33,75 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --------------------------------------------------------------------------- #
+# ML model (lazy-load on first request — avoids blocking startup)
+# --------------------------------------------------------------------------- #
+def _get_embed():
+    """Lazy import so the server starts even if model isn't trained yet."""
+    try:
+        import embed as _embed  # noqa: F401
+        return _embed
+    except ImportError as e:
+        raise HTTPException(500, f"embed module not found: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# /api/ml — Palm Vein Embedding Endpoints
+# --------------------------------------------------------------------------- #
+
+class EmbedRequest(BaseModel):
+    image: str  # base64-encoded PNG/JPEG/BMP (data-URL or raw base64)
+
+
+class EmbedResponse(BaseModel):
+    embedding: List[float]   # 128-d L2-normalized vector
+    dim: int
+    image_type: str          # 'print' (external) | 'vein' (internal/NIR)
+    secure: bool             # True only for internal vein scans
+    pattern: str             # data-URL PNG of the final enhanced identity pattern
+    roi: str                 # data-URL PNG of the cropped palm ROI
+
+
+@app.post("/api/ml/embed", response_model=EmbedResponse)
+async def ml_embed(req: EmbedRequest):
+    """
+    Analyse a palm image and return its biometric embedding + metadata.
+
+    Pipeline (all on GPU): ROI extraction → CLAHE → unsharp → MIN-MAX → gamma 1.5
+    → MobileNetV2 → 128-d L2-normalised embedding. Also classifies the image as an
+    EXTERNAL palm print vs an INTERNAL palm-vein (NIR) scan, and returns the
+    preprocessed identity-pattern image for display.
+
+    Input:  { image: base64 (data-URL accepted) }
+    Output: { embedding, dim, image_type, secure, pattern, roi }
+    """
+    em = _get_embed()
+    try:
+        result = em.analyze_from_base64(req.image)
+        return EmbedResponse(**result)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(503, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Embedding failed: {e}")
+
+
+@app.get("/api/ml/status")
+def ml_status():
+    """Return the current model status (loaded, path, accuracy metrics)."""
+    em = _get_embed()
+    return em.model_status()
+
+
+@app.post("/api/ml/preload")
+def ml_preload():
+    """Force-load the model now (otherwise lazy-loaded on first /embed call)."""
+    em = _get_embed()
+    em.load_model()
+    return {"loaded": True, **em.model_status()}
+
 
 # --------------------------------------------------------------------------- #
 # Deterministic demo data (seeded → stable across restarts)
@@ -174,11 +242,12 @@ METRICS = {
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints
+# Original Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "palmpay", "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "service": "palmpay", "version": "2.0.0",
+            "time": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/api/users", response_model=List[User])

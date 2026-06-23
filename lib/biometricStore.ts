@@ -1,7 +1,6 @@
 'use client';
 
 import { create } from 'zustand';
-import { SerializedDescriptors } from './opencv/matcher';
 
 export interface BiometricUser {
   id: string;
@@ -10,11 +9,13 @@ export interface BiometricUser {
   walletId: string;
   token: string;
   createdAt: number;
-  samples: SerializedDescriptors[];
-  thumb: string; // dataURL preview of the enhanced ROI
+  embeddings: number[][]; // 128-d vectors, one per enrolled sample
+  thumb: string; // dataURL of the final identity pattern
+  imageType: 'print' | 'vein'; // capture modality
+  secure: boolean; // true only when enrolled with an internal vein scan
 }
 
-const KEY = 'palmpay_biometrics_v1';
+const KEY = 'palmpay_biometrics_v2';
 
 function load(): BiometricUser[] {
   if (typeof window === 'undefined') return [];
@@ -31,7 +32,6 @@ function persist(users: BiometricUser[]) {
   try {
     localStorage.setItem(KEY, JSON.stringify(users));
   } catch (e) {
-    // localStorage quota — surface in console, keep in-memory state.
     console.warn('PalmPay: could not persist enrollments', e);
   }
 }

@@ -4,13 +4,19 @@ import { motion } from 'framer-motion';
 import { Camera, CameraOff, Hand, Loader2, ScanLine, Square } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { GlowButton } from '@/components/ui/GlowButton';
+import {
+  cropToCanvas,
+  detectPalm,
+  isHandDetectorReady,
+  preloadHandDetector,
+} from '@/lib/hand/handDetector';
 import { cn } from '@/lib/utils';
 
 interface WebcamScannerProps {
   onCapture: (canvas: HTMLCanvasElement) => void;
   /** True only while a captured frame is actually being processed. */
   busy?: boolean;
-  /** Block capture for an external reason (e.g. engine not ready). */
+  /** Block capture for an external reason (e.g. embedding engine not ready). */
   disabled?: boolean;
   /** Auto mode: continuously fire frames on a timer (no manual button). */
   auto?: boolean;
@@ -22,26 +28,32 @@ interface WebcamScannerProps {
 }
 
 type Status = 'idle' | 'requesting' | 'live' | 'denied' | 'nocam';
+type DetectorState = 'idle' | 'loading' | 'ready' | 'error';
 
 const CAP_W = 640;
 const CAP_H = 480;
+const CROP_OUT = 640;
 
 export function WebcamScanner({
   onCapture,
   busy = false,
   disabled = false,
   auto = false,
-  intervalMs = 650,
+  intervalMs = 700,
   autoStatus,
   onStart,
 }: WebcamScannerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const sampleCanvas = useRef<HTMLCanvasElement | null>(null);
+  // The most recent palm bbox (filled only when a real open palm is detected).
+  const bboxRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+  // Re-entrancy guard so a slow inference can't queue up another.
+  const detectingRef = useRef(false);
 
   const [status, setStatus] = useState<Status>('idle');
   const [ready, setReady] = useState(false);
-  const [hint, setHint] = useState('Align your palm inside the frame');
+  const [detectorState, setDetectorState] = useState<DetectorState>('idle');
+  const [hint, setHint] = useState('Show your open palm to the camera');
 
   // Live values the auto-loop reads without re-subscribing.
   const live = useRef({ ready: false, busy: false, disabled: false });
@@ -50,7 +62,20 @@ export function WebcamScanner({
   const stop = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    bboxRef.current = null;
+    setReady(false);
   }, []);
+
+  const loadDetector = useCallback(() => {
+    if (detectorState !== 'idle') return;
+    setDetectorState('loading');
+    preloadHandDetector()
+      .then(() => setDetectorState('ready'))
+      .catch((e) => {
+        console.error('PalmPay: hand detector failed to load', e);
+        setDetectorState('error');
+      });
+  }, [detectorState]);
 
   const start = useCallback(async () => {
     setStatus('requesting');
@@ -65,64 +90,92 @@ export function WebcamScanner({
         await videoRef.current.play().catch(() => {});
       }
       setStatus('live');
+      loadDetector();
       onStart?.();
     } catch (e: any) {
       if (e?.name === 'NotAllowedError' || e?.name === 'SecurityError') setStatus('denied');
       else setStatus('nocam');
     }
-  }, [onStart]);
+  }, [loadDetector, onStart]);
 
   useEffect(() => () => stop(), [stop]);
 
+  // Strict capture: must have a verified palm bbox at the moment of grab.
   const grab = useCallback(() => {
     const v = videoRef.current;
     if (!v || v.readyState < 2) return;
-    const canvas = document.createElement('canvas');
-    canvas.width = CAP_W;
-    canvas.height = CAP_H;
-    canvas.getContext('2d')!.drawImage(v, 0, 0, CAP_W, CAP_H);
-    onCapture(canvas);
+    const bbox = bboxRef.current;
+    if (!bbox) return; // hard gate — no palm, no capture
+    const cropped = cropToCanvas(v, bbox, CROP_OUT);
+    onCapture(cropped);
   }, [onCapture]);
   const grabRef = useRef(grab);
   grabRef.current = grab;
 
-  // Live readiness probe — luminance mean + detail over the centre region.
+  // Live palm-presence loop: real hand detection at ~3 Hz.
+  // No fallback — `ready` is true ONLY when an open palm is actually detected.
   useEffect(() => {
     if (status !== 'live') return;
-    if (!sampleCanvas.current) sampleCanvas.current = document.createElement('canvas');
-    const sc = sampleCanvas.current;
-    sc.width = 160;
-    sc.height = 120;
-    const ctx = sc.getContext('2d', { willReadFrequently: true })!;
-    const iv = window.setInterval(() => {
+    let stopped = false;
+
+    const loop = async () => {
       const v = videoRef.current;
-      if (!v || v.readyState < 2) return;
-      ctx.drawImage(v, 0, 0, sc.width, sc.height);
-      const bx = 36, by = 18, bw = sc.width - 72, bh = sc.height - 36;
-      const { data } = ctx.getImageData(bx, by, bw, bh);
-      let sum = 0, sumSq = 0;
-      const n = data.length / 4;
-      for (let i = 0; i < data.length; i += 4) {
-        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-        sum += lum;
-        sumSq += lum * lum;
+      if (!v || v.readyState < 2) {
+        if (!stopped) setTimeout(loop, 200);
+        return;
       }
-      const mean = sum / n;
-      const std = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
-      const bright = mean > 45 && mean < 232;
-      const detailed = std > 16;
-      const ok = bright && detailed;
-      setReady(ok);
-      setHint(
-        !bright ? (mean <= 45 ? 'Too dark — find better lighting' : 'Too bright — reduce glare')
-          : !detailed ? 'Move your palm closer to fill the frame'
-            : 'Palm detected — hold steady'
-      );
-    }, 200);
-    return () => window.clearInterval(iv);
+
+      // Guard so we don't pile up tf.js inferences.
+      if (detectingRef.current) {
+        if (!stopped) setTimeout(loop, 120);
+        return;
+      }
+
+      if (!isHandDetectorReady()) {
+        setReady(false);
+        setHint('Loading hand detector…');
+        if (!stopped) setTimeout(loop, 250);
+        return;
+      }
+
+      detectingRef.current = true;
+      try {
+        const result = await detectPalm(v);
+        if (stopped) return;
+        if (result.ok && result.bbox) {
+          bboxRef.current = result.bbox;
+          setReady(true);
+          setHint(`Open palm detected · ${result.extendedFingers} fingers`);
+        } else {
+          bboxRef.current = null;
+          setReady(false);
+          setHint(result.reason);
+        }
+      } catch (e: any) {
+        if (!stopped) {
+          bboxRef.current = null;
+          setReady(false);
+          setHint(`Detection error: ${e?.message ?? e}`);
+        }
+      } finally {
+        detectingRef.current = false;
+        if (!stopped) setTimeout(loop, 320);
+      }
+    };
+    loop();
+
+    return () => {
+      stopped = true;
+    };
   }, [status]);
 
-  // Auto-capture loop: fire a frame whenever positioned and not mid-processing.
+  // When the detector finishes loading, refresh the hint immediately.
+  useEffect(() => {
+    if (detectorState === 'loading') setHint('Loading hand detector (~3MB)…');
+    if (detectorState === 'error') setHint('Hand detector unavailable — please reload.');
+  }, [detectorState]);
+
+  // Auto-capture loop: only fires when ready (= real palm) and not mid-processing.
   useEffect(() => {
     if (!auto || status !== 'live') return;
     const iv = window.setInterval(() => {
@@ -160,24 +213,26 @@ export function WebcamScanner({
               ))}
             </div>
 
-            {/* scan sweep — animates while auto-scanning */}
-            <motion.div
-              className="absolute inset-x-[21%] h-16 bg-gradient-to-b from-transparent via-primary/25 to-transparent"
-              initial={{ top: '12%' }}
-              animate={{ top: ['12%', '78%', '12%'] }}
-              transition={{ duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
-            />
+            {/* scan sweep — only active when a palm is genuinely present */}
+            {ready && (
+              <motion.div
+                className="absolute inset-x-[21%] h-16 bg-gradient-to-b from-transparent via-accent/30 to-transparent"
+                initial={{ top: '12%' }}
+                animate={{ top: ['12%', '78%', '12%'] }}
+                transition={{ duration: 1.8, repeat: Infinity, ease: 'easeInOut' }}
+              />
+            )}
 
             <div className="absolute inset-x-0 bottom-3 flex justify-center">
               <span className={cn('inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold backdrop-blur transition-colors', ready ? 'bg-accent/20 text-accent' : 'bg-ink-900/70 text-mist-200')}>
                 <span className={cn('h-1.5 w-1.5 rounded-full', ready ? 'bg-accent' : 'bg-warn')} />
-                {autoStatus || hint}
+                {ready ? (autoStatus || hint) : hint}
               </span>
             </div>
 
             <div className="absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-md bg-ink-900/70 px-2 py-1 font-mono text-[10px] text-accent backdrop-blur">
-              <span className={cn('h-1.5 w-1.5 rounded-full', busy ? 'bg-primary' : 'bg-danger', 'animate-pulse')} />
-              {busy ? 'PROCESSING' : auto ? 'AUTO-SCANNING' : 'LIVE'} · NIR-SIM
+              <span className={cn('h-1.5 w-1.5 rounded-full animate-pulse', busy ? 'bg-primary' : ready ? 'bg-accent' : 'bg-warn')} />
+              {busy ? 'PROCESSING' : ready ? 'OPEN-PALM · LOCKED' : 'WAITING-FOR-HAND'}
             </div>
           </div>
         )}
@@ -190,7 +245,7 @@ export function WebcamScanner({
                   <Camera className="h-7 w-7" />
                 </span>
                 <p className="mt-4 text-base font-semibold text-white">Camera access required</p>
-                <p className="mt-1 text-sm text-mist-400">We’ll guide you to position your palm — then it scans automatically.</p>
+                <p className="mt-1 text-sm text-mist-400">Hold up an open palm — capture is fully automatic.</p>
               </div>
             )}
             {status === 'requesting' && (
@@ -223,8 +278,8 @@ export function WebcamScanner({
         ) : (
           <div className="flex w-full items-center gap-3">
             <div className="flex flex-1 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-medium text-mist-100">
-              {busy ? <Loader2 className="h-4 w-4 animate-spin text-primary" /> : <ScanLine className="h-4 w-4 text-accent" />}
-              {autoStatus || (ready ? 'Scanning automatically…' : 'Position your palm…')}
+              {busy ? <Loader2 className="h-4 w-4 animate-spin text-primary" /> : <ScanLine className={cn('h-4 w-4', ready ? 'text-accent' : 'text-mist-300')} />}
+              {ready ? (autoStatus || 'Auto-capturing open palm…') : hint}
             </div>
             <button
               onClick={() => { stop(); setStatus('idle'); setReady(false); }}

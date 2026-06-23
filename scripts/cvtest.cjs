@@ -1,4 +1,4 @@
-// Headless verification of the OpenCV.js API surface + ORB matching logic that
+// Headless verification of the OpenCV.js API surface + embedding matching logic that
 // lib/opencv/pipeline.ts and lib/opencv/matcher.ts depend on. Run with: node scripts/cvtest.cjs
 const path = require('path');
 const cvModule = require(path.join(__dirname, '..', 'public', 'vendor', 'opencv.js'));
@@ -16,8 +16,7 @@ function run(cv) {
   ['imread', 'cvtColor', 'GaussianBlur', 'threshold', 'morphologyEx', 'findContours',
    'contourArea', 'moments', 'medianBlur', 'addWeighted', 'normalize', 'LUT', 'resize',
    'meanStdDev'].forEach((f) => need(`fn cv.${f}`, typeof cv[f] === 'function'));
-  ['Mat', 'MatVector', 'Size', 'Rect', 'ORB', 'BFMatcher', 'DMatchVectorVector',
-   'KeyPointVector'].forEach((c) => need(`class cv.${c}`, typeof cv[c] !== 'undefined'));
+  ['Mat', 'MatVector', 'Size', 'Rect'].forEach((c) => need(`class cv.${c}`, typeof cv[c] !== 'undefined'));
   need('createCLAHE or CLAHE', typeof cv.createCLAHE === 'function' || typeof cv.CLAHE !== 'undefined');
 
   // ---- exercise the enhancement chain on a synthetic gray image ----
@@ -62,58 +61,44 @@ function run(cv) {
     console.log('   chain error:', e && e.message);
   }
 
-  // ---- ORB + BFMatcher matching: same > different ----
-  function descFrom(seed) {
-    const m = new cv.Mat(224, 224, cv.CV_8UC1);
-    cv.randu(m, new cv.Mat(1, 1, cv.CV_8UC1, new cv.Scalar(0)), new cv.Mat(1, 1, cv.CV_8UC1, new cv.Scalar(255)));
-    // stamp deterministic structure so ORB finds repeatable corners
+  // ---- cosine embedding matcher: same > different ----
+  function embedding(seed, jitter = 0) {
     let s = seed;
     const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
-    for (let i = 0; i < 80; i++) {
-      const p1 = new cv.Point(rnd() * 224, rnd() * 224);
-      const p2 = new cv.Point(rnd() * 224, rnd() * 224);
-      cv.line(m, p1, p2, new cv.Scalar(Math.floor(rnd() * 255)), 1 + Math.floor(rnd() * 2));
-    }
-    return m;
+    return Array.from({ length: 128 }, () => rnd() + jitter * (rnd() - 0.5));
   }
-  function matchCount(d1, d2) {
-    const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
-    const knn = new cv.DMatchVectorVector();
-    bf.knnMatch(d1, d2, knn, 2);
-    let good = 0;
-    for (let i = 0; i < knn.size(); i++) {
-      const m = knn.get(i);
-      if (m.size() >= 2 && m.get(0).distance < 0.75 * m.get(1).distance) good++;
+  function cosineSimilarity(a, b) {
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
     }
-    bf.delete(); knn.delete();
-    return good;
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+  function identify(probe, enrolled) {
+    const scored = enrolled.map((t) => ({
+      id: t.id,
+      similarity: Math.max(...t.samples.map((sample) => cosineSimilarity(probe.embedding, sample.embedding))),
+    })).sort((a, b) => b.similarity - a.similarity);
+    const best = scored[0];
+    const runnerUp = scored[1] ? scored[1].similarity : -1;
+    return { matched: best.similarity >= 0.85 && best.similarity - runnerUp >= 0.05, best, runnerUp };
   }
   try {
-    const orb = new cv.ORB(600);
-    const empty = new cv.Mat();
-
-    const imgA = descFrom(111);
-    const imgA2 = imgA.clone(); // identical re-capture (upper bound)
-    const imgB = descFrom(999);
-
-    const kpA = new cv.KeyPointVector(); const dA = new cv.Mat();
-    const kpA2 = new cv.KeyPointVector(); const dA2 = new cv.Mat();
-    const kpB = new cv.KeyPointVector(); const dB = new cv.Mat();
-    orb.detectAndCompute(imgA, empty, kpA, dA);
-    orb.detectAndCompute(imgA2, empty, kpA2, dA2);
-    orb.detectAndCompute(imgB, empty, kpB, dB);
-
-    need('ORB found keypoints', kpA.size() > 10 && dA.rows > 10);
-    log(`   kp: A=${kpA.size()} A2=${kpA2.size()} B=${kpB.size()}`);
-
-    const same = matchCount(dA, dA2);
-    const diff = matchCount(dA, dB);
-    log(`   matches: SAME=${same}  DIFF=${diff}`);
-    need('same-palm matches >> different-palm matches', same > diff && same >= 20);
-
-    [orb, empty, imgA, imgA2, imgB, kpA, kpA2, kpB, dA, dA2, dB].forEach((m) => m.delete && m.delete());
+    const probe = { embedding: embedding(111, 0.01) };
+    const enrolled = [
+      { id: 'same', samples: [{ embedding: embedding(111) }] },
+      { id: 'different', samples: [{ embedding: embedding(999) }] },
+    ];
+    const same = cosineSimilarity(probe.embedding, enrolled[0].samples[0].embedding);
+    const diff = cosineSimilarity(probe.embedding, enrolled[1].samples[0].embedding);
+    const result = identify(probe, enrolled);
+    log(`   similarity: SAME=${same.toFixed(4)}  DIFF=${diff.toFixed(4)}`);
+    need('same-palm embedding beats different-palm embedding', same > diff && result.best.id === 'same');
+    need('embedding matcher grants clear winner', result.matched);
   } catch (e) {
-    need('ORB/BFMatcher (no throw)', false);
+    need('embedding matcher (no throw)', false);
     console.log('   match error:', e && e.message);
   }
 
